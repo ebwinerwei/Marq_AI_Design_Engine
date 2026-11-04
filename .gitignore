@@ -21,3 +21,4 @@ venv/
 
 # 3D Auto-saves
 *.blend1
+.DS_Store
