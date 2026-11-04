@@ -1,0 +1,23 @@
+# OS & IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Environment & Secrets
+.env
+.env.local
+*.pem
+*.key
+
+# Dependencies & Build
+node_modules/
+dist/
+build/
+target/
+__pycache__/
+venv/
+*.log
+
+# 3D Auto-saves
+*.blend1
