@@ -948,6 +948,7 @@ class FBXTreeParser {
 		if ( sceneGraph.children.length === 1 && sceneGraph.children[ 0 ].isGroup ) {
 
 			sceneGraph.children[ 0 ].animations = animations;
+			Object.assign( sceneGraph.children[ 0 ].userData, sceneGraph.userData );
 			sceneGraph = sceneGraph.children[ 0 ];
 
 		}
@@ -1554,6 +1555,10 @@ class FBXTreeParser {
 				}
 
 			}
+
+			// Preserve source orientation for Marq static model normalization.
+			if ( 'UpAxis' in fbxTree.GlobalSettings ) sceneGraph.userData.upAxis = Number( fbxTree.GlobalSettings.UpAxis.value );
+			if ( 'UpAxisSign' in fbxTree.GlobalSettings ) sceneGraph.userData.upAxisSign = Number( fbxTree.GlobalSettings.UpAxisSign.value );
 
 			if ( 'UnitScaleFactor' in fbxTree.GlobalSettings ) {
 

@@ -2,8 +2,9 @@
 Set OPENAI_API_KEY, OPENAI_MODEL (Responses + Structured Outputs capable),
 MARQ_DEMO_TOKEN (>= 24 characters). Bind loopback only; not a production gateway.
 """
-import os, json, re, time, hmac, threading, urllib.request, urllib.error
+import os, json, re, time, hmac, threading, urllib.request, urllib.error, socket, ssl
 from pathlib import Path
+from local_config import configure
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 ROOT = Path(__file__).resolve().parent / 'dist'
 LIMITS = {'cols':(12,120),'rows':(4,30),'run':(1,8),'density':(0,70),'middle':(0,30),'seed':(1,999999)}
@@ -15,6 +16,64 @@ props.update({k:{'type':'integer'} for k in LIMITS})
 props['style']={'type':'string','enum':['vertical','horizontal','scatter']}
 def strict_obj(props): return {'type':'object','properties':props,'required':list(props),'additionalProperties':False}
 SCHEMA=strict_obj({'params':strict_obj(props),'narrative':strict_obj({k:{'type':'string'} for k in ('title','structure','meaning','effect')})})
+class AIError(Exception):
+    def __init__(self, code, message, upstream_status=None, request_id=None):
+        super().__init__(code)
+        self.details={'error':code,'message':message}
+        if upstream_status is not None: self.details['upstream_status']=upstream_status
+        # Never return/log upstream free-text, API keys, prompts or response bodies.
+        if isinstance(request_id,str) and re.fullmatch(r'[A-Za-z0-9_-]{1,120}',request_id): self.details['request_id']=request_id
+
+def parse_design(result):
+    if not isinstance(result,dict): raise AIError('AI_invalid_response','AI応答の形式が不正です。もう一度お試しください。')
+    output=result.get('output',[])
+    if not isinstance(output,list): raise AIError('AI_invalid_response','AI応答の形式が不正です。')
+    content=[c for o in output if isinstance(o,dict) and isinstance(o.get('content',[]),list) for c in o.get('content',[]) if isinstance(c,dict)]
+    if any(c.get('type')=='refusal' for c in content): raise AIError('AI_refusal','AIがこの依頼に回答できませんでした。設計意向の表現を変更してください。')
+    if result.get('status')!='completed':
+        detail=result.get('incomplete_details') or {}
+        if isinstance(detail,dict) and detail.get('reason')=='max_output_tokens':
+            raise AIError('AI_output_limit','AIの出力上限に達しました。意向を短くするか、応答の軽い対応モデルでお試しください。')
+        raise AIError('AI_incomplete','AIの生成が完了しませんでした。時間をおいて再実行してください。')
+    raw=''.join(c['text'] for c in content if c.get('type')=='output_text' and isinstance(c.get('text'),str))
+    try: data=json.loads(raw)
+    except (ValueError,TypeError): raise AIError('AI_invalid_json','AIから有効なJSONを取得できませんでした。構造化出力対応モデルをご確認ください。')
+    if not isinstance(data,dict) or not validate(data.get('params')) or not isinstance(data.get('narrative'),dict) or not all(isinstance(data['narrative'].get(k),str) and len(data['narrative'][k])<=3000 for k in ('title','structure','meaning','effect')):
+        raise AIError('invalid_AI_output','AIの案がパラメータの許容範囲を満たしませんでした。意向を簡潔にして再実行してください。')
+    return data
+
+def call_ai(payload,key):
+    req=urllib.request.Request('https://api.openai.com/v1/responses',data=json.dumps(payload).encode(),headers={'Authorization':'Bearer '+key,'Content-Type':'application/json'})
+    try:
+        with urllib.request.urlopen(req,timeout=120) as response: result=json.loads(response.read(2000000))
+    except urllib.error.HTTPError as e:
+        detail={}
+        try:
+            body=json.loads(e.read(65536)); detail=body.get('error',{}) if isinstance(body,dict) else {}; code=detail.get('code') if isinstance(detail,dict) else None
+        except (ValueError,TypeError): code=None
+        if e.code==401: tag,message='OPENAI_AUTH_ERROR','OpenAI APIキーが無効または失効しています。起動時のキーをご確認ください。'
+        elif code=='insufficient_quota': tag,message='OPENAI_QUOTA_ERROR','OpenAI APIの利用枠または請求設定をご確認ください。'
+        elif code=='model_not_found' or e.code==404: tag,message='OPENAI_MODEL_ERROR','モデルID、モデル利用権限、APIへの対応をご確認ください。'
+        elif e.code==403: tag,message='OPENAI_ACCESS_DENIED','OpenAIプロジェクトまたはAPIの利用権限をご確認ください。'
+        elif e.code==429: tag,message='OPENAI_RATE_LIMIT','OpenAI APIの利用制限に達しました。時間をおいて再実行してください。'
+        elif e.code==400: tag,message='OPENAI_REQUEST_ERROR','OpenAIがリクエストを拒否しました。モデルのResponses API・構造化出力対応をご確認ください。'
+        else: tag,message='OPENAI_HTTP_ERROR','OpenAI APIでエラーが発生しました。上流HTTPステータスをご確認ください。'
+        error=AIError(tag,message,e.code,e.headers.get('x-request-id') if e.headers else None)
+        if code in ('invalid_api_key','insufficient_quota','model_not_found','rate_limit_exceeded','unsupported_parameter','unsupported_value','invalid_value','invalid_json_schema','context_length_exceeded'):
+            error.details['upstream_code']=code
+        param=detail.get('param') if isinstance(detail,dict) else None
+        if param in ('model','text','text.format','text.format.schema','text.format.type','max_output_tokens','reasoning','reasoning.effort','input','store'):
+            error.details['upstream_param']=param
+        raise error
+    except (TimeoutError,socket.timeout): raise AIError('OPENAI_TIMEOUT','OpenAIの応答待ちがタイムアウトしました。時間をおくか、応答の軽い対応モデルでお試しください。')
+    except urllib.error.URLError as e:
+        if isinstance(e.reason,(TimeoutError,socket.timeout)): raise AIError('OPENAI_TIMEOUT','OpenAIへの接続がタイムアウトしました。')
+        if isinstance(e.reason,ssl.SSLError): raise AIError('OPENAI_TLS_ERROR','Pythonの証明書またはTLS接続を確認してください。証明書検証は無効化しないでください。')
+        raise AIError('OPENAI_NETWORK_ERROR','OpenAIへ接続できません。ネット接続・VPN・プロキシをご確認ください。')
+    except ssl.SSLError: raise AIError('OPENAI_TLS_ERROR','Pythonの証明書またはTLS接続をご確認ください。')
+    except (ValueError,TypeError): raise AIError('AI_invalid_response','OpenAIから有効なJSON応答を取得できませんでした。')
+    return parse_design(result)
+
 lock=threading.Lock(); last_call=0; slots=threading.BoundedSemaphore(2)
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self,*args,**kwargs): super().__init__(*args,directory=str(ROOT),**kwargs)
@@ -52,15 +111,20 @@ class Handler(SimpleHTTPRequestHandler):
               '. style is vertical, horizontal or scatter. Explain composition, proposed symbolism and intended visual effect. '
               'Preserve cols and rows unless explicitly requested. Do not promise automatic BIM or accurate construction quantities.')
             payload={'model':model,'store':False,'instructions':instruction,'input':json.dumps({'intent':intent,'current':current},ensure_ascii=False),'max_output_tokens':3000,'text':{'format':{'type':'json_schema','name':'facade_design','strict':True,'schema':SCHEMA}}}
-            req=urllib.request.Request('https://api.openai.com/v1/responses',data=json.dumps(payload).encode(),headers={'Authorization':'Bearer '+key,'Content-Type':'application/json'})
-            with urllib.request.urlopen(req,timeout=55) as response: result=json.loads(response.read(2000000))
-            if result.get('status')!='completed': return self.answer(502,{'error':'AI_incomplete'})
-            raw=''.join(c.get('text','') for o in result.get('output',[]) for c in o.get('content',[]) if c.get('type')=='output_text')
-            data=json.loads(raw)
-            if not validate(data.get('params')) or not isinstance(data.get('narrative'),dict) or not all(isinstance(data['narrative'].get(k),str) and len(data['narrative'][k])<=3000 for k in ('title','structure','meaning','effect')): return self.answer(502,{'error':'invalid_AI_output'})
-            self.answer(200,data)
-        except (urllib.error.URLError,TimeoutError,ValueError,KeyError,TypeError): self.answer(502,{'error':'AI_upstream_failed'})
+            self.answer(200,call_ai(payload,key))
+        except AIError as e:
+            print('[Marq AI] '+json.dumps(e.details,ensure_ascii=False),flush=True)
+            self.answer(502,e.details)
         finally: slots.release()
 if __name__=='__main__':
+    import sys
+    try:
+        config=configure(force='--configure' in sys.argv)
+    except (ValueError,OSError) as e:
+        print('配置读取或保存失败。请检查本项目 .marq-local.json 的格式和文件权限；原文件未自动删除。')
+        sys.exit(1)
+    print('模型：'+config['OPENAI_MODEL'])
+    print('网页AI访问令牌（首次填入后可记住）：'+config['MARQ_DEMO_TOKEN'])
+    print('配置已保存在本项目，下次直接运行 python3 server.py。修改配置：python3 server.py --configure')
     print('Marq local demo: http://127.0.0.1:8080 (AI optional; use environment variables)')
     ThreadingHTTPServer(('127.0.0.1',8080),Handler).serve_forever()

@@ -6,24 +6,29 @@ const materialCache=new WeakMap();
 // Prevent large CAD coordinates from being cancelled inside GPU float matrices.
 export function normalizeStaticModel(source, targetSize=90) {
   source.updateMatrixWorld(true);
-  const bounds=new THREE.Box3().setFromObject(source);
+  const axis=source.userData.upAxis ?? 1, sign=source.userData.upAxisSign ?? 1;
+  if(![0,1,2].includes(axis)||![1,-1].includes(sign))throw Error('FBX UpAxis metadata is invalid');
+  const sourceUp=new THREE.Vector3().setComponent(axis,sign);
+  const orientation=new THREE.Matrix4().makeRotationFromQuaternion(new THREE.Quaternion().setFromUnitVectors(sourceUp,new THREE.Vector3(0,1,0)));
+  const bounds=new THREE.Box3().setFromObject(source).applyMatrix4(orientation);
   const size=bounds.getSize(new THREE.Vector3()), max=Math.max(size.x,size.y,size.z);
   if(!Number.isFinite(max)||max<=1e-9)throw Error('モデル寸法が不正です');
   const center=bounds.getCenter(new THREE.Vector3()); center.y=bounds.min.y;
   const scale=targetSize/max, group=new THREE.Group(), seen=new Set();
-  const report={meshes:0,triangles:0,duplicatesRemoved:0,degenerateRemoved:0,sourceMax:max,previewScale:scale};
+  const report={meshes:0,triangles:0,duplicatesRemoved:0,degenerateRemoved:0,sourceMax:max,previewScale:scale,axisConverted:axis!==1||sign!==1,sourceUpAxis:axis};
   source.traverse(mesh=>{
     if(!mesh.isMesh)return;for(let ancestor=mesh;ancestor;ancestor=ancestor.parent){if(!ancestor.visible)return;}
     const src=mesh.geometry, idx=src.index, pos=src.attributes.position;
     const attributes=Object.fromEntries(Object.entries(src.attributes).filter(([name])=>!['skinIndex','skinWeight','tangent'].includes(name)).map(([name,a])=>[name,{itemSize:a.itemSize,array:[]}]));
     if(!attributes.normal)attributes.normal={itemSize:3,array:[]};
-    const normalMatrix=new THREE.Matrix3().getNormalMatrix(mesh.matrixWorld), mirrored=mesh.matrixWorld.determinant()<0;
+    const worldMatrix=new THREE.Matrix4().multiplyMatrices(orientation,mesh.matrixWorld);
+    const normalMatrix=new THREE.Matrix3().getNormalMatrix(worldMatrix), mirrored=worldMatrix.determinant()<0;
     const geometry=new THREE.BufferGeometry();let offset=0,lastMat=-1;
     const vector=new THREE.Vector3(), vnormal=new THREE.Vector3();
     const count=idx?idx.count:pos.count;
     for(let i=0;i<count;i+=3){
       const indices=[0,1,2].map(k=>idx?idx.getX(i+k):i+k);if(mirrored)[indices[1],indices[2]]=[indices[2],indices[1]];
-      const points=indices.map(j=>new THREE.Vector3().fromBufferAttribute(pos,j).applyMatrix4(mesh.matrixWorld).sub(center).multiplyScalar(scale));
+      const points=indices.map(j=>new THREE.Vector3().fromBufferAttribute(pos,j).applyMatrix4(worldMatrix).sub(center).multiplyScalar(scale));
       const face=new THREE.Vector3().subVectors(points[1],points[0]).cross(new THREE.Vector3().subVectors(points[2],points[0]));
       if(!points.every(v=>[v.x,v.y,v.z].every(Number.isFinite))||face.lengthSq()<1e-18){report.degenerateRemoved++;continue}
       const key=triangleKey(points);
